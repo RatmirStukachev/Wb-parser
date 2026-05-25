@@ -79,13 +79,7 @@ class WildberriesParser:
         while page <= max_pages:
             print(f"Обработка страницы {page}...", end="\r")
 
-            # Формируем URL для API
-            # Актуальный домен API может меняться (catalog.wb.ru или search.wb.ru). Используем универсальный catalog.wb.ru/catalog/{shard}/v2/catalog
-            # Но сейчас WB использует search.wb.ru/exactmatch/ru/common/v5/search или catalog.wb.ru/catalog/{shard}/v2/catalog
-            # Попробуем catalog.wb.ru/catalog/{shard}/v2/catalog
-            # Для надежности используем API v2:
-            # https://catalog.wb.ru/catalog/{shard}/v2/catalog?{query}&page={page}&dest=-1257786
-
+            # Из-за блокировок/таймаутов меняем домен на search.wb.ru или catalog.wb.ru
             api_url = f"https://catalog.wb.ru/catalog/{shard}/v4/catalog"
             params = {
                 "ab_testing": "false",
@@ -103,7 +97,7 @@ class WildberriesParser:
 
             response = None
             try:
-                response = self.session.get(api_url, params=params, timeout=10)
+                response = self.session.get(api_url, params=params, timeout=30)
 
                 # WB может возвращать 204 No Content, когда страницы заканчиваются
                 if response.status_code == 204:
@@ -151,15 +145,58 @@ class WildberriesParser:
                 time.sleep(0.5) # Небольшая пауза, чтобы не забанили
 
             except requests.exceptions.RequestException as e:
-                # If we hit 429 Too Many Requests, wait and retry
-                if response is not None and response.status_code == 429:
-                    print(f"\nСлишком много запросов (429). Ждем 10 секунд и повторяем попытку страницы {page}...")
-                    time.sleep(10)
+                # Check for 429 inside the exception handling specifically to retry
+                if getattr(e.response, 'status_code', None) == 429 or (response is not None and response.status_code == 429):
+                    print(f"\nСлишком много запросов (429). Ждем 15 секунд и повторяем попытку страницы {page}...")
+                    time.sleep(15)
                     continue
                 else:
-                    print(f"\nОшибка сети на странице {page}: {e}")
-                    time.sleep(2)
-                    break
+                    print(f"\nОшибка сети на странице {page}: {e}. Пробуем еще раз через 10 сек...")
+                    time.sleep(10)
+                    # Try once more on timeout before breaking
+                    try:
+                        response = self.session.get(api_url, params=params, timeout=30)
+                        response.raise_for_status()
+                        data = response.json()
+                        products = data.get('data', {}).get('products', []) if 'data' in data else data.get('products', [])
+                        if not products:
+                            break
+
+                        for p in products:
+                            item_id = p.get('id')
+                            sizes = p.get('sizes', [])
+                            price_discount = None
+                            price_basic = None
+                            if sizes and 'price' in sizes[0]:
+                                price_info = sizes[0]['price']
+                                price_discount = price_info.get('total', 0) / 100 if 'total' in price_info else None
+                                price_basic = price_info.get('basic', 0) / 100 if 'basic' in price_info else None
+                            else:
+                                price_discount = p.get('salePriceU', 0) / 100 if 'salePriceU' in p else None
+                                price_basic = p.get('priceU', 0) / 100 if 'priceU' in p else None
+
+                            product_data = {
+                                'ID': item_id,
+                                'Название': p.get('name', ''),
+                                'Бренд': p.get('brand', ''),
+                                'Цена со скидкой': price_discount,
+                                'Цена без скидки': price_basic,
+                                'Рейтинг': p.get('reviewRating', 0),
+                                'Количество отзывов': p.get('feedbacks', 0),
+                                'Ссылка': f"https://www.wildberries.ru/catalog/{item_id}/detail.aspx"
+                            }
+                            all_products.append(product_data)
+                        page += 1
+                        time.sleep(0.5)
+                        continue
+                    except Exception as e2:
+                        # If the retry failed due to 429, we should try again next loop
+                        if getattr(e2, 'response', None) is not None and e2.response.status_code == 429:
+                            print(f"Слишком много запросов (429) при повторе. Ждем и повторяем...")
+                            time.sleep(15)
+                            continue
+                        print(f"Повторная ошибка на странице {page}: {e2}. Пропускаем.")
+                        break
             except Exception as e:
                 print(f"\nНепредвиденная ошибка на странице {page}: {e}")
                 break
